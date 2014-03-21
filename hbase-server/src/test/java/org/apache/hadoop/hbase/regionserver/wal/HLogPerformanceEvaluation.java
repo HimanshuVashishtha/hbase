@@ -54,6 +54,7 @@ import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
+import com.yammer.metrics.core.Counter;
 import com.yammer.metrics.core.Histogram;
 import com.yammer.metrics.core.Meter;
 import com.yammer.metrics.core.MetricsRegistry;
@@ -68,6 +69,9 @@ import com.yammer.metrics.reporting.ConsoleReporter;
 public final class HLogPerformanceEvaluation extends Configured implements Tool {
   static final Log LOG = LogFactory.getLog(HLogPerformanceEvaluation.class.getName());
   private final MetricsRegistry metrics = new MetricsRegistry();
+
+  private final Counter inflightAppendsCounter =
+    metrics.newCounter(HLogPerformanceEvaluation.class, "inflightAppends");
   private final Meter syncMeter =
     metrics.newMeter(HLogPerformanceEvaluation.class, "syncMeter", "syncs", TimeUnit.MILLISECONDS);
   private final Histogram syncHistogram =
@@ -273,6 +277,19 @@ public final class HLogPerformanceEvaluation extends Configured implements Tool 
           appendMeter.mark(size);
           return size;
         }
+        
+        @Override
+        protected Path getDir() {
+          // TODO Auto-generated method stub
+          return super.getDir();
+        }
+
+        @Override
+        void postWALSwitch(int size) {
+          LOG.warn("HLogPE, Appending inflights=" + size);
+          inflightAppendsCounter.inc(size);
+        }
+
       };
       hlog.registerWALActionsListener(new WALActionsListener() {
         private int appends = 0;
@@ -343,9 +360,25 @@ public final class HLogPerformanceEvaluation extends Configured implements Tool 
             if (!fs.exists(p)) throw new IllegalStateException(p.toString());
             editCount += verify(p, verbose);
           }
-          long expected = numIterations * numThreads;
-          if (editCount != expected) {
-            throw new IllegalStateException("Counted=" + editCount + ", expected=" + expected);
+          long expectedWithoutWALSwitch = numIterations * numThreads;
+          if (inflightAppendsCounter.count() > 0) {
+            // switching occurs. It may happen that some writes were not completed and
+            // were interrupted.
+            // We can define the range of number of edits:
+            // (numIterations * threads + infligtEditsCount) >= x >= numIterations * threads
+            LOG.warn("Counted=" +
+                editCount + ", expected range=[" + expectedWithoutWALSwitch + ", " +
+                (inflightAppendsCounter.count() + expectedWithoutWALSwitch) + "]");
+            if (editCount > (inflightAppendsCounter.count() + expectedWithoutWALSwitch) ||
+                editCount < expectedWithoutWALSwitch)
+              throw new IllegalStateException("Counted=" +
+                editCount + ", expected range=[" + expectedWithoutWALSwitch + ", " +
+                inflightAppendsCounter.count() + expectedWithoutWALSwitch + "]");
+          } else {
+            if (editCount != expectedWithoutWALSwitch) {
+              throw new IllegalStateException("Counted=" + editCount +
+                ", expected=" + expectedWithoutWALSwitch);
+            }
           }
         }
       } finally {

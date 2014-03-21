@@ -113,6 +113,14 @@ class RingBufferTruck {
     return ret;
   }
 
+  public int compareTo(RingBufferTruck other) {
+    if (this == other) return 0;
+    if (this.entry == other.entry) return 0;
+    long l1 = this.entry.getSequence();
+    long l2 = other.entry.getSequence();
+    return (l1 < l2 ? -1 : (l1 == l2 ? 0 : 1));
+  }
+
   /**
    * Factory for making a bunch of these.  Needed by the ringbuffer/disruptor.
    */

@@ -31,7 +31,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -209,6 +211,12 @@ class FSHLog implements HLog, Syncable {
    */
   volatile Writer writer;
 
+  /**
+   * A reserved writer to be used when the current active writer straggles and WAL Switch
+   * is enabled
+   */
+  private volatile Writer reservedWriter;
+
   /** The barrier used to ensure that close() waits for all log rolls and flushes to finish. */
   private final DrainBarrier closeBarrier = new DrainBarrier();
 
@@ -330,6 +338,19 @@ class FSHLog implements HLog, Syncable {
    */
   private NavigableMap<Path, Map<byte[], Long>> byWalRegionSequenceIds =
     new ConcurrentSkipListMap<Path, Map<byte[], Long>>(LOG_NAME_COMPARATOR);
+
+  /**
+   * contains the "in-flight" sync ops, i.e., SyncFuture(s) which are being synced by the current
+   * writer.
+   */
+  Map<Thread, Long> inflightSyncOps = null;
+
+  private final boolean walSwitchingEnabled;
+
+  /**
+   * WALSwitcher instance to provide wal switching functionality.
+   */
+  private final WALSwitcher walSwitcher;
 
   /**
    * Exception handler to pass the disruptor ringbuffer.  Same as native implemenation only it
@@ -490,6 +511,10 @@ class FSHLog implements HLog, Syncable {
         throw new IOException("Unable to mkdir " + this.fullPathOldLogDir);
       }
     }
+    walSwitchingEnabled = conf.getBoolean("hbase.regionserver.wal.switch.enabled", false);
+    LOG.debug("isWALSwitchingEnabled=" + walSwitchingEnabled);
+    // rollWriter sets this.hdfs_out if it can.
+    if (walSwitchingEnabled) reservedWriter = rollWriterInternal(true, null, false);
 
     // rollWriter sets this.hdfs_out if it can.
     rollWriter();
@@ -528,6 +553,21 @@ class FSHLog implements HLog, Syncable {
     this.syncFuturesByHandler = new ConcurrentHashMap<Thread, SyncFuture>(maxHandlersCount);
     // Starting up threads in constructor is a no no; Interface should have an init call.
     this.disruptor.start();
+    walSwitcher = initWALSwitchAttrsAndGetWALSwitcher();
+  }
+
+  /**
+   * Inits the required attributes required by WALSwitching feature, and returns the WALSwitcher
+   * reference.
+   * @return if WALSwitching is enabled, it returns a reference to the WALSwitcher object, null
+   * otherwise.
+   */
+  private WALSwitcher initWALSwitchAttrsAndGetWALSwitcher() {
+    if (!walSwitchingEnabled) return null;
+    inflightSyncOps = new ConcurrentHashMap<Thread, Long>();
+    WALSwitcher ws = new WALSwitcher();
+    ws.init();
+    return ws;
   }
 
   /**
@@ -651,48 +691,72 @@ class FSHLog implements HLog, Syncable {
   }
 
   @Override
-  public byte [][] rollWriter(boolean force) throws FailedLogCloseException, IOException {
+  public byte[][] rollWriter(boolean force) throws FailedLogCloseException, IOException {
     rollWriterLock.lock();
     try {
       // Return if nothing to flush.
-      if (!force && (this.writer != null && this.numEntries.get() <= 0)) return null;
-      byte [][] regionsToFlush = null;
-      if (this.closed) {
-        LOG.debug("HLog closed. Skipping rolling of writer");
-        return regionsToFlush;
-      }
-      if (!closeBarrier.beginOp()) {
-        LOG.debug("HLog closing. Skipping rolling of writer");
-        return regionsToFlush;
-      }
-      try {
-        Path oldPath = getOldPath();
-        Path newPath = getNewPath();
-        // Any exception from here on is catastrophic, non-recoverable so we currently abort.
-        FSHLog.Writer nextWriter = this.createWriterInstance(fs, newPath, conf);
-        FSDataOutputStream nextHdfsOut = null;
-        if (nextWriter instanceof ProtobufLogWriter) {
-          nextHdfsOut = ((ProtobufLogWriter)nextWriter).getStream();
-          // If a ProtobufLogWriter, go ahead and try and sync to force setup of pipeline.
-          // If this fails, we just keep going.... it is an optimization, not the end of the world.
-          preemptiveSync((ProtobufLogWriter)nextWriter);
-        }
-        tellListenersAboutPreLogRoll(oldPath, newPath);
-        // NewPath could be equal to oldPath if replaceWriter fails.
-        newPath = replaceWriter(oldPath, newPath, nextWriter, nextHdfsOut);
-        tellListenersAboutPostLogRoll(oldPath, newPath);
-        // Can we delete any of the old log files?
-        if (getNumRolledLogFiles() > 0) {
-          cleanOldLogs();
-          regionsToFlush = findRegionsToForceFlush();
-        }
-      } finally {
-        closeBarrier.endOp();
+      Writer newWriter = rollWriterInternal(force, this.writer, true);
+      if (newWriter == null) return null; // roll doesn't happen
+      byte[][] regionsToFlush = null;
+      // Can we delete any of the old log files?
+      if (getNumRolledLogFiles() > 0) {
+        cleanOldLogs();
+        regionsToFlush = findRegionsToForceFlush();
       }
       return regionsToFlush;
     } finally {
       rollWriterLock.unlock();
     }
+  }
+
+  /**
+   * Rolls the passed writer. Caller must hold rollWriterLock if they want to replace the current
+   * writer (i.e., if the parameter replaceCurrentWriter is true).
+   * @param force true means roll even if there is no entry in the current WAL.
+   * @param oldWriter the writer to roll
+   * @param replaceCurrentWriter whether to replace the current 'this.writer' with the new writer.
+   * @return new Writer.
+   * @throws IOException
+   */
+  private Writer rollWriterInternal(boolean force, Writer oldWriter, boolean replaceCurrentWriter)
+      throws IOException {
+    if (!force && (oldWriter != null && this.numEntries.get() <= 0)) return null;
+    if (this.closed) {
+      LOG.debug("HLog closed. Skipping rolling of writer");
+      return null;
+    }
+    if (!closeBarrier.beginOp()) {
+      LOG.debug("HLog closing. Skipping rolling of writer");
+      return null;
+    }
+    FSHLog.Writer nextWriter = null;
+    try {
+      Path oldPath = null;
+      Path newPath = null;
+      if (oldWriter == null) {
+        newPath = getNewPath();
+      } else {
+        oldPath = oldWriter.getCurrentWriterPath();
+        newPath = getNewPath();
+      }
+      // In case we are replacing current writer, any exception from here on is catastrophic,
+      // non-recoverable so we currently abort.
+      nextWriter = this.createWriterInstance(fs, newPath, conf);
+      FSDataOutputStream nextHdfsOut = null;
+      if (nextWriter instanceof ProtobufLogWriter) {
+        nextHdfsOut = ((ProtobufLogWriter) nextWriter).getStream();
+        // If a ProtobufLogWriter, go ahead and try and sync to force setup of pipeline.
+        // If this fails, we just keep going.... it is an optimization, not the end of the world.
+        preemptiveSync((ProtobufLogWriter) nextWriter);
+      }
+      tellListenersAboutPreLogRoll(oldPath, newPath);
+      // NewPath could be equal to oldPath if replaceWriter fails.
+      if (replaceCurrentWriter) replaceWriter(oldPath, newPath, nextWriter, nextHdfsOut);
+      tellListenersAboutPostLogRoll(oldPath, newPath);
+    } finally {
+      closeBarrier.endOp();
+    }
+    return nextWriter;
   }
 
   /**
@@ -837,7 +901,7 @@ class FSHLog implements HLog, Syncable {
   /**
    * Cleans up current writer closing it and then puts in place the passed in
    * <code>nextWriter</code>
-   * 
+   * Assumes caller holds rollWriterLock.
    * @param oldPath
    * @param newPath
    * @param nextWriter
@@ -966,7 +1030,7 @@ class FSHLog implements HLog, Syncable {
    */
   protected Path computeFilename() {
     if (this.filenum.get() < 0) {
-      throw new RuntimeException("hlog file number can't be < 0");
+      throw new IllegalArgumentException("hlog file number can't be < 0");
     }
     String child = logFilePrefix + "." + filenum;
     if (forMeta) {
@@ -1057,6 +1121,12 @@ class FSHLog implements HLog, Syncable {
     }
     // With disruptor down, this is safe to let go.
     if (this.appendExecutor !=  null) this.appendExecutor.shutdown();
+
+    // If switching is enabled, close out its resources
+    if (walSwitchingEnabled) {
+      if (this.walSwitcher != null) this.walSwitcher.close();
+      if (this.reservedWriter != null) this.reservedWriter.close();
+    }
 
     // Tell our listeners that the log is closing
     if (!this.listeners.isEmpty()) {
@@ -1167,6 +1237,25 @@ class FSHLog implements HLog, Syncable {
   }
 
   /**
+   * @param sequence The sequence we ran the filesystem sync against.
+   * @return Current highest synced sequence.
+   */
+  private long updateHighestSyncedSequence(long sequence) {
+    long currentHighestSyncedSequence;
+    // Set the highestSyncedSequence IFF our current sequence id is the 'highest'.
+    do {
+      currentHighestSyncedSequence = this.highestSyncedSequence.get();
+      if (currentHighestSyncedSequence >= sequence) {
+        // Set the sync number to current highwater mark; might be able to let go more
+        // queued sync futures
+        sequence = currentHighestSyncedSequence;
+        break;
+      }
+    } while (!this.highestSyncedSequence.compareAndSet(currentHighestSyncedSequence, sequence));
+    return sequence;
+  }
+
+  /**
    * Thread to runs the hdfs sync call. This call takes a while to complete.  This is the longest
    * pole adding edits to the WAL and this must complete to be sure all edits persisted.  We run
    * multiple threads sync'ng rather than one that just syncs in series so we have better
@@ -1184,7 +1273,17 @@ class FSHLog implements HLog, Syncable {
   private class SyncRunner extends HasThread {
     private volatile long sequence;
     private final BlockingQueue<SyncFuture> syncFutures;
- 
+    /**
+     * List of Append ops it is syncing in this batch.
+     */
+     private List<FSWALEntry> appendsToSync;
+
+     /**
+      * The current SyncFuture taken from the blocking queue which is being processed.
+      * We need this to make the WAL switch as it is an 'in-flight' SyncFuture.
+      */
+     private SyncFuture currentSyncFutureInProgress;
+
     /**
      * UPDATE! 
      * @param syncs the batch of calls to sync that arrived as this thread was starting; when done,
@@ -1203,9 +1302,11 @@ class FSHLog implements HLog, Syncable {
       this.syncFutures = new LinkedBlockingQueue<SyncFuture>(maxHandlersCount);
     }
 
-    void offer(final long sequence, final SyncFuture [] syncFutures, final int syncFutureCount) {
+    void offer(final long sequence, final SyncFuture [] syncFutures, final int syncFutureCount,
+        List<FSWALEntry> appendsToSync) {
       // Set sequence first because the add to the queue will wake the thread if sleeping.
       this.sequence = sequence;
+      this.appendsToSync = appendsToSync;
       for (int i = 0; i < syncFutureCount; i++) this.syncFutures.add(syncFutures[i]);
     }
 
@@ -1213,27 +1314,41 @@ class FSHLog implements HLog, Syncable {
      * Release the passed <code>syncFuture</code>
      * @param syncFuture
      * @param currentSequence
+     * @param offeredSequence The offeredSequence of the SyncRunner, as set in the 'offer' method
      * @param t
      * @return Returns 1.
      */
     private int releaseSyncFuture(final SyncFuture syncFuture, final long currentSequence,
-        final Throwable t) {
-      if (!syncFuture.done(currentSequence, t)) throw new IllegalStateException();
-      // This function releases one sync future only.
-      return 1;
-    }
- 
+        final long offeredSequence, final Throwable t) {
+      if (!syncFuture.done(currentSequence, offeredSequence, t) &&
+          !walSwitchingEnabled) {
+        LOG.warn("SyncFuture couldn't be done " + syncFuture + ", currentSequence=" +
+          currentSequence);
+        // set the SyncFuture as failed so handler goes away.
+        // If switching enabled, old SyncRunner and SwitchMonitor race to 'do' the SyncFuture.
+        // If the SyncFuture has been completed by SwitchMonitor, and old SyncRunner tries to do
+        // it later, it returns false, so, it is normal and safe to not fail the syncFuture.
+        syncFuture.doneAndMarkAsFailed(currentSequence, t);
+        throw new IllegalStateException("SyncFuture couldn't be done " + syncFuture +
+          ", currentSequence=" + currentSequence);
+      }
+    // This function releases one sync future only.
+    return 1;
+  }
+
     /**
      * Release all SyncFutures whose sequence is <= <code>currentSequence</code>.
      * @param currentSequence
+     * @param offeredSequence The offeredSequence of the SyncRunner, as set in the 'offer' method
      * @param t May be non-null if we are processing SyncFutures because an exception was thrown.
      * @return Count of SyncFutures we let go.
      */
-    private int releaseSyncFutures(final long currentSequence, final Throwable t) {
+    private int releaseSyncFutures(final long currentSequence, final long offeredSequence,
+        final Throwable t) {
       int syncCount = 0;
       for (SyncFuture syncFuture; (syncFuture = this.syncFutures.peek()) != null;) {
         if (syncFuture.getRingBufferSequence() > currentSequence) break;
-        releaseSyncFuture(syncFuture, currentSequence, t);
+        releaseSyncFuture(syncFuture, currentSequence, offeredSequence, t);
         if (!this.syncFutures.remove(syncFuture)) {
           throw new IllegalStateException(syncFuture.toString());
         }
@@ -1242,45 +1357,25 @@ class FSHLog implements HLog, Syncable {
       return syncCount;
     }
 
-    /**
-     * @param sequence The sequence we ran the filesystem sync against.
-     * @return Current highest synced sequence.
-     */
-    private long updateHighestSyncedSequence(long sequence) {
-      long currentHighestSyncedSequence;
-      // Set the highestSyncedSequence IFF our current sequence id is the 'highest'.
-      do {
-        currentHighestSyncedSequence = highestSyncedSequence.get();
-        if (currentHighestSyncedSequence >= sequence) {
-          // Set the sync number to current highwater mark; might be able to let go more
-          // queued sync futures
-          sequence = currentHighestSyncedSequence;
-          break;
-        }
-      } while (!highestSyncedSequence.compareAndSet(currentHighestSyncedSequence, sequence));
-      return sequence;
-    }
-
     public void run() {
       long currentSequence;
       while (!isInterrupted()) {
         int syncCount = 0;
-        SyncFuture takeSyncFuture;
         try {
           while (true) {
             // We have to process what we 'take' from the queue
-            takeSyncFuture = this.syncFutures.take();
+            currentSyncFutureInProgress = this.syncFutures.take();
             currentSequence = this.sequence;
-            long syncFutureSequence = takeSyncFuture.getRingBufferSequence();
+            long syncFutureSequence = currentSyncFutureInProgress.getRingBufferSequence();
             if (syncFutureSequence > currentSequence) {
-              throw new IllegalStateException("currentSequence=" + syncFutureSequence +
+              throw new IllegalStateException("currentSequence=" + currentSequence +
                 ", syncFutureSequence=" + syncFutureSequence);
             }
             // See if we can process any syncfutures BEFORE we go sync.
             long currentHighestSyncedSequence = highestSyncedSequence.get();
             if (currentSequence < currentHighestSyncedSequence) {
-              syncCount += releaseSyncFuture(takeSyncFuture, currentHighestSyncedSequence, null);
-              // Done with the 'take'.  Go around again and do a new 'take'.
+              syncCount += releaseSyncFuture(currentSyncFutureInProgress,
+                currentHighestSyncedSequence, sequence, null);
               continue;
             }
             break;
@@ -1288,10 +1383,16 @@ class FSHLog implements HLog, Syncable {
           // I got something.  Lets run.  Save off current sequence number in case it changes
           // while we run.
           long start = System.nanoTime();
+          if (inflightSyncOps != null)
+            inflightSyncOps.put(getThread(), EnvironmentEdgeManager.currentTimeMillis());
           Throwable t = null;
           try {
             writer.sync();
             currentSequence = updateHighestSyncedSequence(currentSequence);
+          } catch (InterruptedIOException e) {
+            LOG.error("Error syncing, request close of hlog ", e);
+            Thread.currentThread().interrupt();
+            t = e;
           } catch (IOException e) {
             LOG.error("Error syncing, request close of hlog ", e);
             t = e;
@@ -1299,10 +1400,13 @@ class FSHLog implements HLog, Syncable {
             LOG.warn("UNEXPECTED", e);
             t = e;
           } finally {
-            // First release what we 'took' from the queue.
-            syncCount += releaseSyncFuture(takeSyncFuture, currentSequence, t);
+            // First remove the entry from the monitoring map
+            if (inflightSyncOps != null) inflightSyncOps.remove(getThread());
+            // release what we 'took' from the queue.
+            syncCount += releaseSyncFuture(currentSyncFutureInProgress, currentSequence,
+              this.sequence, t);
             // Can we release other syncs?
-            syncCount += releaseSyncFutures(currentSequence, t);
+            syncCount += releaseSyncFutures(currentSequence, this.sequence, t);
             if (t != null) {
               requestLogRoll();
             } else checkLogRoll();
@@ -1666,7 +1770,12 @@ class FSHLog implements HLog, Syncable {
      * Latch to wait on.  Will be released when we can proceed.
      */
     private volatile CountDownLatch safePointReleasedLatch = new CountDownLatch(1);
- 
+    /**
+     * A marker value Thread A can share to Thread B to inform about its status about the reached
+     * safepoint.
+     */
+    private long safePointMarker;
+
     /**
      * For Thread A to call when it is ready to wait on the 'safe point' to be attained.
      * Thread A will be held in here until Thread B calls {@link #safePointAttained()}
@@ -1697,6 +1806,26 @@ class FSHLog implements HLog, Syncable {
     void safePointAttained() throws InterruptedException {
       this.safePointAttainedLatch.countDown();
       this.safePointReleasedLatch.await();
+    }
+
+    /**
+     * Called by Thread B when it attains the 'safe point'. In this method, Thread B signals
+     * Thread A it can proceed. Thread B will be held in here until {@link #releaseSafePoint()}
+     * is called by Thread A. Thread B sets the marker point so as it can be read by Thread A to
+     * determine the safepoint state, if needed.
+     * @throws InterruptedException
+     */
+    void safePointAttained(long safePointMarker) throws InterruptedException {
+      this.safePointMarker = safePointMarker;
+      this.safePointAttainedLatch.countDown();
+      this.safePointReleasedLatch.await();
+    }
+
+    /**
+     * @return the safepoint marker state.
+     */
+    private long getSafePointMarker() {
+      return safePointMarker;
     }
 
     /**
@@ -1746,6 +1875,10 @@ class FSHLog implements HLog, Syncable {
     private volatile int syncFuturesCount = 0;
     private volatile SafePointZigZagLatch zigzagLatch;
     /**
+     * zigzag latch to co-ordinate with the WAL Switching.
+     */
+    private volatile SafePointZigZagLatch walSwitchLatch;
+    /**
      * Object to block on while waiting on safe point.
      */
     private final Object safePointWaiter = new Object();
@@ -1755,6 +1888,11 @@ class FSHLog implements HLog, Syncable {
      * Which syncrunner to use next.
      */
     private int syncRunnerIndex;
+    /**
+     * These entries are passed to the SyncRunner when it does the sync. These are called
+     * 'in-flight' Appends as the SyncRunner is trying to 'sync' these Appends.
+     */
+    private List<FSWALEntry> entries = new ArrayList<FSWALEntry>();
 
     RingBufferEventHandler(final int syncRunnerCount, final int maxHandlersCount) {
       this.syncFutures = new SyncFuture[maxHandlersCount];
@@ -1765,7 +1903,8 @@ class FSHLog implements HLog, Syncable {
     }
 
     private void cleanupOutstandingSyncsOnException(final long sequence, final Exception e) {
-      for (int i = 0; i < this.syncFuturesCount; i++) this.syncFutures[i].done(sequence, e);
+      for (int i = 0; i < this.syncFuturesCount; i++)
+        this.syncFutures[i].done(sequence, sequence, e);
       this.syncFuturesCount = 0;
     }
 
@@ -1787,7 +1926,9 @@ class FSHLog implements HLog, Syncable {
           if (this.syncFuturesCount == this.syncFutures.length) endOfBatch = true;
         } else if (truck.hasFSWALEntryPayload()) {
           try {
-            append(truck.unloadFSWALEntryPayload());
+            FSWALEntry e = truck.unloadFSWALEntryPayload();
+            this.entries.add(e); // saving a local reference to re-use for WAL switch
+            append(e);
           } catch (Exception e) {
             // If append fails, presume any pending syncs will fail too; let all waiting handlers
             // know of the exception.
@@ -1814,19 +1955,42 @@ class FSHLog implements HLog, Syncable {
         if (LOG.isTraceEnabled()) {
           LOG.trace("Sequence=" + sequence + ", syncCount=" + this.syncFuturesCount);
         }
-
+        checkAndAttainSafePointForSwitching(sequence);
         // Below expects that the offer 'transfers' responsibility for the outstanding syncs to the
         // syncRunner.
         int index = Math.abs(this.syncRunnerIndex++) % this.syncRunners.length;
-        this.syncRunners[index].offer(sequence, this.syncFutures, this.syncFuturesCount);
+        this.syncRunners[index].offer(sequence, this.syncFutures, this.syncFuturesCount,
+          this.entries);
         attainSafePoint(sequence);
-        this.syncFuturesCount = 0;
+        resetSFCountAndAppendList();
       } catch (Throwable t) {
         LOG.error("UNEXPECTED!!!", t);
       } finally {
         // This scope only makes sense for the append. Syncs will be pulled-up short so tracing
         // will not give a good representation. TODO: Fix.
         if (scope != null) scope.close();
+      }
+    }
+
+    private void resetSFCountAndAppendList() {
+      this.syncFuturesCount = 0;
+      this.entries = new ArrayList<FSWALEntry>();
+    }
+
+    private SafePointZigZagLatch attainSafePointForWALSwitching() {
+      this.walSwitchLatch = new SafePointZigZagLatch();
+      return this.walSwitchLatch;
+    }
+
+    private void checkAndAttainSafePointForSwitching(long sequence) {
+      if (this.walSwitchLatch == null || !this.walSwitchLatch.isCocked()) return;
+      // blocks the RingBufferEventHandler till and tell the SwitchWriter that it can proceed with
+      // switching
+      try {
+        this.walSwitchLatch.safePointAttained(sequence);
+      } catch (InterruptedException e) {
+        LOG.warn("Interrupted ", e);
+        Thread.currentThread().interrupt();
       }
     }
 
@@ -1922,8 +2086,386 @@ class FSHLog implements HLog, Syncable {
     }
   }
 
+  /**
+   * This inner class provides WAL Switching functionality. It switches the current WAL writer to a
+   * reserved WAL writer in case the former becomes slow for any reason. The decision whether to
+   * make switch is done after consulting {@link WALSwitchPolicy}.
+   *
+   * <p>
+   * At the core is SyncOpsMonitor (SM), which is daemon thread monitoring all the 'in-flight' HDFS
+   * sync() calls. A SyncRunner registers itself before calling the sync(), and unregisters when
+   * done.
+   *
+   * <p>
+   * If any sync op takes more time than {@link WALSwitchPolicy#getWalSwitchThreshold()}, it
+   * consults with the {@link WALSwitchPolicy} whether it is a time to do a switch or not.
+   *
+   * <p>
+   * There are some invariants to be maintained while doing a WAL switch:
+   * <ul>
+   * <li>There must not be any OUT-OF-ORDER WAL edits in any WAL file.
+   * <li>A Switch involves taking all the in-flight WALEdits and append-sync them to a new WAL
+   * writer. It must use the same WALEdits objects while maintaining their order.
+   * </ul>
+   *
+   * <p>
+   * Some ASCII art to show how SyncRunner (SR), and SyncMonitor (SM) are interacting
+   * when switching is enabled.
+   *
+   *(SyncRunner)                                                 (SyncMonitor)
+   *    |                                  Map<Thread: Time>          |
+   *    |                                 |-----------------|         |(continuously
+   *    X-- Registers Sync Call --------->| SR : Start time |<--------| watches the map)
+   *    |                                 |-----------------|         |<---|
+   *    |                                                             |<---|
+   *    |                                 |                 |         |
+   *    X Unregisters when done---------->|                 |         |
+   *    \/                                |                 |         \/
+   *
+   *<p>
+   * The below list is the major events occured while doing a WAL switch:
+   * <ul>
+   * <li> Block the RingBuffer at a safepoint, sequence id X.
+   * <li> SM takes the list of All Appends, and Sync ops, and does an append-sync.
+   * <li> It releases those SFs which have sequence Id <= X. Those SFs with sequence Id > X
+   * would be taken care by when RingBuffer is unblocked, and the SF goes to a SR. The reason it
+   * has higher sequence Id than X is by the time SyncMonitor processed this SF, the old SR has
+   * already synced, and released it, and the freed handler has again put it in the RingBuffer,
+   * with a higher sequence Id.
+   * <li> Switch the Writers, and re-start the SRs, and then unblock the RingBuffer.
+   * </ul>
+   *
+   * <p>
+   * The above model adds minimal overhead for the 'regular' case. Measurement shows there is
+   * almost no extra context switching overhead when there is no switch occurred and the
+   * switching threshold is 1 sec.
+   *
+   * <p>
+   * It adds one extra thread (SyncMonitor).
+   */
+  private class WALSwitcher {
+
+    /**
+     * Monitor thread that monitors the in-flight sync ops.
+     */
+    private SyncOpsMonitor monitor;
+
+    /**
+     * configured switch policy
+     */
+    private WALSwitchPolicy switchPolicy;
+
+    /**
+     * Is there is a WAL switch in-progress.
+     */
+    private volatile boolean switching = false;
+
+    /**
+     * Number of switches incurred so far. Used for naming SyncRunners.
+     */
+    private int switchCount = 0;
+
+    private void init() {
+      this.monitor = new SyncOpsMonitor("WALSwitcher.SyncOpsMonitor");
+      Class<? extends WALSwitchPolicy> switchPolicyClass = conf.getClass(
+        "hbase.regionserver.wal.switch.policy", AggressiveWALSwitchPolicy.class,
+        WALSwitchPolicy.class);
+      try {
+        switchPolicy = (WALSwitchPolicy) switchPolicyClass.newInstance();
+        switchPolicy.init(conf);
+      } catch (Exception e) {
+        LOG.warn("Couldn't instantiate the configured WAL Switch policy.", e);
+      }
+      this.monitor.setDaemon(true);
+      this.monitor.start();
+    }
+
+  /**
+   * The SyncMonitor (SM) thread, which monitors the on-going sync ops.
+   */
+  private class SyncOpsMonitor extends HasThread {
+
+    public SyncOpsMonitor(String threadName) {
+      super(threadName);
+    }
+
+    @Override
+    public void run() {
+        while (!this.isInterrupted()) {
+          try {
+            if (!switching && eligibleForWALSwitch()) {
+              // check with the Switch policy to see what it thinks about making a switch.
+              try {
+                LOG.info("Making a WAL switch");
+                switchWALWriter();
+              } catch (IOException ioe) {
+                // Rolling of the old WAL file fails. This is fatal for us. We play safe and kill
+                // ourself otherwise switching again might result in out-of-order edits. In regular
+                // flow, LogRoller would also detect this and abort the RegionServer.
+                throw new IllegalStateException("Could Not Roll WAL File," +
+                 " Aborting the SyncOpsMonitor", ioe);
+              }
+            }
+            Thread.sleep(switchPolicy.getWalSwitchThreshold());
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+          }
+        }
+    }
+
+    /**
+     * Iterates over the in-progress Sync ops start time, and check it with configured
+     * {@link WALSwitchPolicy} whether it is time to make a WAL Switch.
+     * @return true if it should make a WALSwitch, false otherwise
+     */
+    private boolean eligibleForWALSwitch() {
+      Long startTime = EnvironmentEdgeManager.currentTimeMillis();
+      for (Map.Entry<Thread, Long> e : inflightSyncOps.entrySet()) {
+          // check the current sync-op time with the SwitchPolicy
+          // and decide whether to make a switch.
+        if (switchPolicy.makeAWALSwitch(startTime - e.getValue().longValue())) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+
+  /**
+   * The core method for switching the WAL writer when the current one starts straggling.
+   *
+   * NOTE: Don't switch if there is a ongoing log roll. Most likely, this could be a redundant
+   * step.
+   *
+   * Below is the list of steps involved when doing a WAL switch.
+   * <ul>
+   * <li> Try to take the rollWriter lock. If we couldn't, abort this Switch attempt. This is to
+   * avoid WAL switching because of a WAL roll.
+   * <li> Block the {@link RingBufferEventHandler#onEvent(RingBufferTruck, long, boolean)}. using
+   * a zigzag latch. And, note the sequence Id at which it is blocked.
+   * <li> Grab the 'in-flight' Append and SyncFuture lists (i.e., whatever they were trying to
+   *  sync).
+   * <li> Use the "reserved" writer to append-sync these 'in-flight' edits
+   * <li> Swap the current writer to this reserved writer
+   * <li> Release all the current SFs which has sequenceId < 'X'
+   * <li> Interrupt SyncRunners. Create new SyncRunners and set them in the RBH.
+   * <li> Set {@link FSHLog#switching} to false
+   * <li> Roll the old writer
+   * <li> Release the rollWriter lock.
+   * </ul>
+   * <p>
+   * Error Handling: We are safe as long as we have not switched "this.writer". Once we are past
+   * that, ensure we roll the old writer, otherwise we kill the SwitchMonitor. This is to avoid
+   * any out-of-order edits.
+   * @throws IOException
+   * @throws InterruptedException
+   */
+  private void switchWALWriter() throws IOException {
+      if (rollWriterLock.tryLock()) {
+        switchCount++;
+        SafePointZigZagLatch zigzagLatch = null;
+        try {
+          switching = true;
+          zigzagLatch = (ringBufferEventHandler == null) ? null : ringBufferEventHandler
+              .attainSafePointForWALSwitching();
+          // we want the RBH to come to a safe point (basically, block itself) when we are making
+          // the switch. Getting the zigzaglatch and publishing a SyncFuture on it would ensure
+          // the RBH reaches the safepoint.
+          // NOTE: Consider Syncs which are less than ringBufferBlockedPointMarker.
+          long ringBufferBlockedPointMarker = -1l; // the ringbufferSequence at which is blocked.
+          try {
+            if (zigzagLatch != null) {
+              zigzagLatch.waitSafePoint(publishSyncOnRingBuffer());
+              ringBufferBlockedPointMarker = zigzagLatch.getSafePointMarker();
+            }
+          } catch (Exception e) {
+            // couldn't block the ring buffer, fail the switching process.
+            LOG.warn("Couldn't block the RingBufferEventHandler, aborting the WAL switching.", e);
+            return;
+          }
+          LOG.debug("RBT should be blocked at = " + ringBufferBlockedPointMarker);
+
+          // Get the list of Appends, and SyncFutures from SRs. And, also include from the RBH.
+          // First create TreeSets for both Appends, and SyncFuturs, and then populate them.
+          Set<FSWALEntry> inFlightAppendsSet = createInflightAppendsSet();
+          Set<SyncFuture> inflightSyncFuturesSet = createInflightSyncFuturesSet();
+          Path oldPath = null;
+          Map<byte[], Long> highestRegionSeqIdsForCurWAL = null;
+          try {
+            populateInflightAppendsAndSFs(ringBufferBlockedPointMarker, inFlightAppendsSet,
+              inflightSyncFuturesSet);
+            Throwable t = null;
+            oldPath = writer.getCurrentWriterPath();
+            try {
+              for (FSWALEntry e : inFlightAppendsSet)
+                reservedWriter.append(e);
+              reservedWriter.sync();
+              postWALSwitch(inFlightAppendsSet.size());
+            } catch (IOException ioe) {
+              t = ioe;
+            } catch (Exception e) {
+              t = e;
+            } finally {
+              // update the maxSyncedSequence
+              updateHighestSyncedSequence(ringBufferBlockedPointMarker);
+              // release the SyncFuture, which should be released.
+              // Now that we have process all the inflight appends and sync. we can interrupt the
+              // SR threads, and create new SRs.
+              for (SyncFuture sf : inflightSyncFuturesSet) {
+                // it may happen that the SF is completed by the original thread meanwhile while
+                // were switching. In that case, check whether we should invoke the done call or
+                // the handler thread is already unblocked.
+                synchronized (sf) {
+                  if (!sf.isDone() && sf.getRingBufferSequence() <= ringBufferBlockedPointMarker) {
+                    sf.done(ringBufferBlockedPointMarker, ringBufferBlockedPointMarker, t);
+                  }
+                }
+              }
+            }
+            for (int i = 0; i < ringBufferEventHandler.syncRunners.length; i++) {
+              ringBufferEventHandler.syncRunners[i].interrupt();
+              // create a new SR.
+              ringBufferEventHandler.syncRunners[i] = new SyncRunner("sync.sw." + i + "-"
+                  + switchCount, conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT, 200));
+              ringBufferEventHandler.syncRunners[i].start();
+            }
+            // swap the writer
+            Writer tmpWriter = writer;
+            writer = reservedWriter;
+            if (writer instanceof ProtobufLogWriter) {
+              hdfs_out = ((ProtobufLogWriter) writer).getStream();
+            }
+            reservedWriter = tmpWriter;
+          } finally {
+            // release the safepoint in order to RBH resume its processing.
+            ringBufferEventHandler.resetSFCountAndAppendList();
+            if (zigzagLatch != null) zigzagLatch.releaseSafePoint();
+          }
+          // get the region:sequenceId map. Use it book keeping the while rolling the current WAL
+          // (soon be old) file. We don't reset it as the same entries are used by new writer.
+          highestRegionSeqIdsForCurWAL = new HashMap<byte[], Long>(highestRegionSequenceIds);
+          // roll the reserved writer
+          reservedWriter = rollWriterInternal(true, reservedWriter, false);
+          if (oldPath != null) byWalRegionSequenceIds.put(oldPath, highestRegionSeqIdsForCurWAL);
+          switching = false;
+        } finally {
+          rollWriterLock.unlock();
+        }
+      } else {
+      LOG.info("Couldn't get the roll writer lock, continuing");
+      }
+    }
+
+  /**
+   * Take the 'in-flight' Appends and SyncFutures from SyncRunners and RingBuffer. Take only
+   * those which have sequence Id < ringBufferBlockedPointMarker.
+   * @param ringBufferBlockedPointMarker
+   * @param inFlightAppendsSet
+   * @param inflightSyncFuturesSet
+   */
+  private void populateInflightAppendsAndSFs(final long ringBufferBlockedPointMarker,
+     final Set<FSWALEntry> inFlightAppendsSet, final Set<SyncFuture> inflightSyncFuturesSet) {
+    getInflightEntriesFromSyncRunners(ringBufferBlockedPointMarker, inFlightAppendsSet,
+      inflightSyncFuturesSet);
+
+    // Add RBH intransit A's and SFs
+    getInflightEntriesFromRB(ringBufferBlockedPointMarker, inFlightAppendsSet,
+      inflightSyncFuturesSet);
+  }
+
+  /**
+   * Take inflight Appends and SFs from RB. Ignore which have larger sequence Ids than its
+   * blocked point.
+   * @param ringBufferBlockedPointMarker
+   * @param inFlightAppendsSet
+   * @param inflightSyncFuturesSet
+   */
+  private void getInflightEntriesFromRB(final long ringBufferBlockedPointMarker,
+      final Set<FSWALEntry> inFlightAppendsSet,
+      final Set<SyncFuture> inflightSyncFuturesSet) {
+    if (ringBufferEventHandler.entries != null && ringBufferEventHandler.entries.size() > 0) 
+      inFlightAppendsSet.addAll(ringBufferEventHandler.entries);
+    for (int i = 0; i < ringBufferEventHandler.syncFuturesCount; i++) {
+      if (ringBufferEventHandler.syncFutures[i] == null ||
+          ringBufferEventHandler.syncFutures[i].isDone() ||
+          (ringBufferEventHandler.syncFutures[i].getRingBufferSequence() >
+          ringBufferBlockedPointMarker)) continue;
+     inflightSyncFuturesSet.add(ringBufferEventHandler.syncFutures[i]);
+    }
+  }
+
+  /**
+   * Take the inflight Syncs and Appends fron current SyncRunners. Since a SyncRunners 'takes' a
+   * SyncFuture, also take the current in-progress SyncFuture. The SyncFuture could be stuck on
+   * this SyncFuture and it needs to be processed too.
+   * @param ringBufferBlockedPointMarker
+   * @param inFlightAppendsSet
+   * @param inflightSyncFuturesSet
+   */
+  private void getInflightEntriesFromSyncRunners(final long ringBufferBlockedPointMarker,
+      final Set<FSWALEntry> inFlightAppendsSet,
+      final Set<SyncFuture> inflightSyncFuturesSet) {
+    for (SyncRunner s : ringBufferEventHandler.syncRunners) {
+      if (s.appendsToSync != null && s.appendsToSync.size() > 0) {
+        inFlightAppendsSet.addAll(s.appendsToSync);
+      }
+      // take the current one.
+      if (s.currentSyncFutureInProgress  != null)
+        inflightSyncFuturesSet.add(s.currentSyncFutureInProgress);
+        for (SyncFuture sf : s.syncFutures) {
+          if (sf == null || sf.isDone()) continue;
+          if (sf.getRingBufferSequence() > ringBufferBlockedPointMarker) continue;
+          inflightSyncFuturesSet.add(sf);
+      }
+    }
+  }
+
+  /**
+   * @return a TreeSet to store SyncFutures (it is accessed by a single thread, so TeeSet is safe)
+   */
+  private TreeSet<SyncFuture> createInflightSyncFuturesSet() {
+    return new TreeSet<SyncFuture>(
+        new Comparator<SyncFuture>() {
+          @Override
+          public int compare(SyncFuture o1, SyncFuture o2) {
+            if (o1 == o2) return 0;
+            long l1 = o1.getRingBufferSequence();
+            long l2 = o2.getRingBufferSequence();
+            return (l1 < l2 ? -1 : (l1 == l2 ? 0 : 1));
+          }
+    });
+  }
+
+  /**
+   * @return a TreeSet to store FSWALEntries (it is accessed by a single thread, so TeeSet is safe)
+   */
+  private TreeSet<FSWALEntry> createInflightAppendsSet() {
+    return new TreeSet<FSWALEntry>(
+        new Comparator<FSWALEntry>() {
+          @Override
+          public int compare(FSWALEntry o1, FSWALEntry o2) {
+            if (o1 == o2) return 0;
+            long l1 = o1.getSequence();
+            long l2 = o2.getSequence();
+            return (l1 < l2 ? -1 : (l1 == l2 ? 0 : 1));
+          }
+    });
+  }
+
+  private void close() {
+      if (monitor != null) monitor.interrupt();
+    }
+  }
+
   private static IOException ensureIOException(final Throwable t) {
     return (t instanceof IOException)? (IOException)t: new IOException(t);
+  }
+
+  void postWALSwitch(int size) {
+    if (metrics != null) {
+      metrics.incrementInFlightAppendsWhileWALSwitch(size);
+      metrics.finishWALSwitch();
+    }
   }
 
   private static void usage() {

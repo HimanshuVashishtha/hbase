@@ -37,10 +37,12 @@ public abstract class WriterBase implements HLog.Writer {
 
   protected CompressionContext compressionContext;
   protected Configuration conf;
+  private Path path;
 
   @Override
   public void init(FileSystem fs, Path path, Configuration conf, boolean overwritable) throws IOException {
     this.conf = conf;
+    this.path = path;
   }
 
   public boolean initializeCompressionContext(Configuration conf, Path path) throws IOException {
@@ -57,4 +59,8 @@ public abstract class WriterBase implements HLog.Writer {
     return doCompress;
   }
 
+  @Override
+  public Path getCurrentWriterPath() {
+    return this.path;
+  }
 }

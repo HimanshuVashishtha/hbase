@@ -57,6 +57,11 @@ public interface MetricsWALSource extends BaseSource {
   String SLOW_APPEND_COUNT_DESC = "Number of appends that were slow.";
   String SYNC_TIME = "syncTime";
   String SYNC_TIME_DESC = "The time it took to sync the HLog to HDFS.";
+  String APPEND_COUNT_IN_WAL_SWITCH = "inflightAppendCountInWALSwitch";
+  String APPEND_COUNT_IN_WAL_SWITCH_DESC = "Inflight Appends added to new WAL writer during" +
+  		" Switching";
+  String WAL_SWITCH_COUNT = "walSwitchCount";
+  String WAL_SWITCH_COUNT_DESC = "Number of WAL switches";
 
   /**
    * Add the append size.
@@ -82,5 +87,16 @@ public interface MetricsWALSource extends BaseSource {
    * Add the time it took to sync the hlog.
    */
   void incrementSyncTime(long time);
+
+  /**
+   * Increment the number of inflight appends that got added while WAL switching
+   * @param inflightAppendsCount
+   */
+  void incrementInflightAppendCountInWALSwitch(int inflightAppendsCount);
+
+  /**
+   * Increment the WALSwitch count
+   */
+  void incrementWALSwitchCount();
 
 }

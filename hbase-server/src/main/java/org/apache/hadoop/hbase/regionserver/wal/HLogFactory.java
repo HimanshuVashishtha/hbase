@@ -71,7 +71,11 @@ public class HLogFactory {
     static void resetLogReaderClass() {
       logReaderClass = null;
     }
-
+    
+    static void resetLogWriterClass() {
+      logWriterClass = null;
+    }
+    
     public static HLog.Reader createReader(final FileSystem fs,
         final Path path, Configuration conf) throws IOException {
       return createReader(fs, path, conf, null);

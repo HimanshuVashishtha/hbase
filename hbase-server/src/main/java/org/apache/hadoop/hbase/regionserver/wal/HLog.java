@@ -117,6 +117,10 @@ public interface HLog {
     long getLength() throws IOException;
 
     /**
+     * @return the Path of this writer.
+     */
+    Path getCurrentWriterPath();
+    /**
      * Sets HLog/WAL's WALTrailer. This trailer is appended at the end of WAL on closing.
      * @param walTrailer trailer to append to WAL.
      */

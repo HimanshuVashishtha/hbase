@@ -37,6 +37,9 @@ public class MetricsWALSourceImpl extends BaseSourceImpl implements MetricsWALSo
   private final MetricHistogram syncTimeHisto;
   private final MutableCounterLong appendCount;
   private final MutableCounterLong slowAppendCount;
+  private final MutableCounterLong appendCountInWALSwitch;
+  private final MutableCounterLong walSwitchCount;
+
 
   public MetricsWALSourceImpl() {
     this(METRICS_NAME, METRICS_DESCRIPTION, METRICS_CONTEXT, METRICS_JMX_CONTEXT);
@@ -54,6 +57,10 @@ public class MetricsWALSourceImpl extends BaseSourceImpl implements MetricsWALSo
     appendCount = this.getMetricsRegistry().newCounter(APPEND_COUNT, APPEND_COUNT_DESC, 0l);
     slowAppendCount = this.getMetricsRegistry().newCounter(SLOW_APPEND_COUNT, SLOW_APPEND_COUNT_DESC, 0l);
     syncTimeHisto = this.getMetricsRegistry().newHistogram(SYNC_TIME, SYNC_TIME_DESC);
+    appendCountInWALSwitch = this.getMetricsRegistry().newCounter(APPEND_COUNT_IN_WAL_SWITCH,
+      APPEND_COUNT_IN_WAL_SWITCH_DESC, 0l);
+    walSwitchCount = this.getMetricsRegistry().newCounter(WAL_SWITCH_COUNT, WAL_SWITCH_COUNT_DESC,
+      0l);
   }
 
   @Override
@@ -79,5 +86,15 @@ public class MetricsWALSourceImpl extends BaseSourceImpl implements MetricsWALSo
   @Override
   public void incrementSyncTime(long time) {
     syncTimeHisto.add(time);
+  }
+
+  @Override
+  public void incrementInflightAppendCountInWALSwitch(int inflightAppendsCount) {
+    appendCountInWALSwitch.incr(inflightAppendsCount);
+  }
+
+  @Override
+  public void incrementWALSwitchCount() {
+    walSwitchCount.incr();
   }
 }

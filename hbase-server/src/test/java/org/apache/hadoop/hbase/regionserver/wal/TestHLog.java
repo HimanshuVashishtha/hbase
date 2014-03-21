@@ -20,9 +20,11 @@ package org.apache.hadoop.hbase.regionserver.wal;
 
 import static org.junit.Assert.*;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.BindException;
+import java.net.URI;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -38,6 +40,7 @@ import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hbase.*;
 import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -52,6 +55,7 @@ import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
+import org.apache.hadoop.util.Progressable;
 import org.apache.log4j.Level;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -60,6 +64,8 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
 
 /** JUnit test case for HLog */
 @Category(LargeTests.class)
@@ -1184,6 +1190,8 @@ public class TestHLog  {
     hlog.startCacheFlush(regionEncodedName);
     hlog.completeCacheFlush(regionEncodedName);
   }
+
+
 
   static class DumbWALActionsListener implements WALActionsListener {
     int increments = 0;

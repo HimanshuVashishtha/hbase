@@ -68,6 +68,10 @@ class SyncFuture {
   private Throwable throwable = null;
 
   private Thread t;
+  /**
+   * The last completed sequence Id. 
+   */
+  private long lastCompletedSequence = -1;
 
   /**
    * Call this method to clear old usage and get it ready for new deploy. Call
@@ -80,8 +84,10 @@ class SyncFuture {
     if (t != null && t != Thread.currentThread()) throw new IllegalStateException();
     t = Thread.currentThread();
     if (!isDone()) throw new IllegalStateException("" + sequence + " " + Thread.currentThread());
+    this.lastCompletedSequence = this.doneSequence;
     this.doneSequence = NOT_DONE;
     this.ringBufferSequence = sequence;
+    
     return this;
   }
 
@@ -100,17 +106,34 @@ class SyncFuture {
    * @return True if we successfully marked this outstanding future as completed/done.
    * Returns false if this future is already 'done' when this method called.
    */
-  synchronized boolean done(final long sequence, final Throwable t) {
+  synchronized boolean done(final long sequence, final long offeredSequence, final Throwable t) {
+    // Earlier we would throw IllegalStateException whether the passed
+    // sequence < this.ringBufferSequence. This is no longer true because if the current
+    // SyncRunner is stuck, the SwitchMonitor would complete the SyncFuture. And, the SyncFuture
+    // could be put again into the RingBuffer by the RegionServer handler. If the old SyncRunner
+    // now becomes live, it would try to release this SF, but its sequence Id < ringBufferSequence.
+
+    // More interestingly, before coming here, the old SyncRunner could also update its sequence
+    // Id equal to current highestSyncedSequenceId, and then would try to mark this SynFuture
+    // as done. We can't allow that as it wouldn't be true, i.e., we could be acking for writes
+    // that never got sync'ed.
+
+    // We now rather check the last completed sequence Id with the offeredSequence value of the
+    // SyncRunner. In case the offeredSequence < lastCompletedSequence, it means the SyncFuture
+    // is already passed the state which SyncRunner is trying to complete. In case switching is not
+    // enabled, this should never be true, and we throw an IllegalStateException in the
+    // FSHLog#releaseSyncFuture method.
+
+    // The below condition means that SR trying to complete a SF which is already completed.
+    // it is like completing a old SF (but it is again cocked because of a new request from RBH
+    // and would be handled by another done request from a separate SR. Ignore its error too.
+    if (offeredSequence < this.lastCompletedSequence) return false;
+ 
     if (isDone()) return false;
+    // coming here means it has the right to process it. Any 't' is valid.
     this.throwable = t;
-    if (sequence < this.ringBufferSequence) {
-      // Something badly wrong.
-      if (throwable == null) {
-        this.throwable = new IllegalStateException("sequence=" + sequence +
-          ", ringBufferSequence=" + this.ringBufferSequence);
-      }
-    }
-    // Mark done.
+
+   // Mark done.
     this.doneSequence = sequence;
     // Wake up waiting threads.
     notify();
@@ -148,5 +171,19 @@ class SyncFuture {
 
   synchronized Throwable getThrowable() {
     return this.throwable;
+  }
+
+  public long getLastCompletedRingBufferSequence() {
+    return lastCompletedSequence;
+  }
+
+  /**
+   * Mark the current SyncFuture as completed and failed.
+   * @param sequence
+   * @param t
+   */
+  public synchronized void doneAndMarkAsFailed(long sequence, Throwable t) {
+    this.doneSequence = sequence;
+    this.throwable = t;
   }
 }

@@ -58,4 +58,13 @@ public class MetricsWAL {
           StringUtils.humanReadableInt(size)));
     }
   }
+
+  public void incrementInFlightAppendsWhileWALSwitch(int inflightAppendsCount) {
+    source.incrementInflightAppendCountInWALSwitch(inflightAppendsCount);
+  }
+
+  public void finishWALSwitch() {
+    source.incrementWALSwitchCount();
+  }
+
 }
